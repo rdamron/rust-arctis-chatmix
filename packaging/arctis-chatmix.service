@@ -1,0 +1,12 @@
+[Unit]
+Description=Arctis Nova Pro Wireless ChatMix daemon (Game/Chat virtual sinks)
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/arctis-chatmix
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

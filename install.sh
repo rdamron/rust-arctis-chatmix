@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installer for arctis-chatmix. Everything is user-level (~/.local/bin +
+# Installer for rust-arctis-chatmix. Everything is user-level (~/.local/bin +
 # systemd user unit); the only optional root step is a udev rule on distros
 # where hidraw isn't accessible to the seated user (not needed on Bazzite).
 #
@@ -8,11 +8,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN=arctis-chatmix
+BIN=rust-arctis-chatmix
 TARGET=x86_64-unknown-linux-musl
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
-UDEV_RULE=/etc/udev/rules.d/70-arctis-chatmix.rules
+UDEV_RULE=/etc/udev/rules.d/70-rust-arctis-chatmix.rules
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 
@@ -31,8 +31,8 @@ run_systemctl() {
 
 uninstall() {
     say "Stopping and disabling service"
-    run_systemctl disable --now arctis-chatmix 2>/dev/null || true
-    rm -f "$BIN_DIR/$BIN" "$UNIT_DIR/arctis-chatmix.service"
+    run_systemctl disable --now rust-arctis-chatmix 2>/dev/null || true
+    rm -f "$BIN_DIR/$BIN" "$UNIT_DIR/rust-arctis-chatmix.service"
     run_systemctl daemon-reload || true
     say "Removed $BIN_DIR/$BIN and the systemd unit."
     if [ -e "$UDEV_RULE" ]; then
@@ -69,12 +69,12 @@ fi
 
 say "Installing $BIN to $BIN_DIR"
 install -Dm755 "$SRC" "$BIN_DIR/$BIN"
-install -Dm644 "$SCRIPT_DIR/packaging/arctis-chatmix.service" "$UNIT_DIR/arctis-chatmix.service"
+install -Dm644 "$SCRIPT_DIR/packaging/rust-arctis-chatmix.service" "$UNIT_DIR/rust-arctis-chatmix.service"
 
 say "Enabling and (re)starting the systemd user service"
 run_systemctl daemon-reload
-run_systemctl enable arctis-chatmix
-run_systemctl restart arctis-chatmix
+run_systemctl enable rust-arctis-chatmix
+run_systemctl restart rust-arctis-chatmix
 
 # --- 2. hidraw permission check (root only needed if this fails)
 node=""
@@ -95,7 +95,7 @@ elif [ -r "$node" ] && [ -w "$node" ]; then
 else
     say "No access to $node — installing a udev rule (needs sudo)"
     sudo tee "$UDEV_RULE" >/dev/null <<'EOF'
-# SteelSeries Arctis Nova Pro Wireless base station — user access for arctis-chatmix
+# SteelSeries Arctis Nova Pro Wireless base station — user access for rust-arctis-chatmix
 KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e0", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e5", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="225d", TAG+="uaccess"
@@ -105,5 +105,5 @@ EOF
 fi
 
 say "Done."
-say "Logs:            journalctl --user -u arctis-chatmix -f"
+say "Logs:            journalctl --user -u rust-arctis-chatmix -f"
 say "Headset status:  $BIN status"

@@ -1,5 +1,5 @@
 [package]
-name = "arctis-chatmix"
+name = "rust-arctis-chatmix"
 version = "0.1.0"
 edition = "2021"
 description = "ChatMix daemon for SteelSeries Arctis Nova Pro Wireless: creates Game/Chat PipeWire sinks and drives their volumes from the base station wheel"

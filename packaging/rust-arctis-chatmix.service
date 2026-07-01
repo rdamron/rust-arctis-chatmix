@@ -4,7 +4,7 @@ After=pipewire.service pipewire-pulse.service
 Wants=pipewire-pulse.service
 
 [Service]
-ExecStart=%h/.local/bin/arctis-chatmix
+ExecStart=%h/.local/bin/rust-arctis-chatmix
 Restart=on-failure
 RestartSec=5
 

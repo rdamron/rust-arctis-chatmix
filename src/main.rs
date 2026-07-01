@@ -82,7 +82,7 @@ fn install_signal_handlers() {
 }
 
 fn log(msg: &str) {
-    println!("arctis-chatmix: {msg}");
+    println!("rust-arctis-chatmix: {msg}");
 }
 
 fn log_verbose(msg: &str) {
@@ -558,7 +558,7 @@ impl Session {
                     "-u",
                     "critical",
                     "-a",
-                    "arctis-chatmix",
+                    "rust-arctis-chatmix",
                     "Arctis headset battery low",
                     &format!("{pct}% remaining"),
                 ])
@@ -668,18 +668,18 @@ fn run_session(hidraw: &PathBuf, manage_default: bool) -> Result<bool, String> {
 
 fn cmd_status() -> i32 {
     let Some(hidraw) = find_hidraw() else {
-        eprintln!("arctis-chatmix: base station not found (is it plugged in?)");
+        eprintln!("rust-arctis-chatmix: base station not found (is it plugged in?)");
         return 1;
     };
     let mut dev = match OpenOptions::new().read(true).write(true).open(&hidraw) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("arctis-chatmix: cannot open {}: {e}", hidraw.display());
+            eprintln!("rust-arctis-chatmix: cannot open {}: {e}", hidraw.display());
             return 1;
         }
     };
     if dev.write(&pad_command(&STATUS_REQUEST)).is_err() {
-        eprintln!("arctis-chatmix: failed to send status request");
+        eprintln!("rust-arctis-chatmix: failed to send status request");
         return 1;
     }
 
@@ -719,7 +719,7 @@ fn cmd_status() -> i32 {
         println!("auto off:     {}", st.auto_off_str());
         return 0;
     }
-    eprintln!("arctis-chatmix: no status response from base station");
+    eprintln!("rust-arctis-chatmix: no status response from base station");
     1
 }
 
@@ -729,10 +729,10 @@ fn cmd_status() -> i32 {
 
 fn usage() {
     println!(
-        "arctis-chatmix — ChatMix daemon for the Arctis Nova Pro Wireless\n\
+        "rust-arctis-chatmix — ChatMix daemon for the Arctis Nova Pro Wireless\n\
          \n\
-         usage: arctis-chatmix [--verbose] [--no-default-sink]\n\
-         \x20      arctis-chatmix status\n\
+         usage: rust-arctis-chatmix [--verbose] [--no-default-sink]\n\
+         \x20      rust-arctis-chatmix status\n\
          \n\
          Runs as a daemon: creates the Arctis Game / Arctis Chat PipeWire sinks\n\
          and maps the base station's ChatMix wheel onto their volumes.\n\
@@ -757,7 +757,7 @@ fn main() {
                 return;
             }
             other => {
-                eprintln!("arctis-chatmix: unknown argument: {other}");
+                eprintln!("rust-arctis-chatmix: unknown argument: {other}");
                 usage();
                 std::process::exit(2);
             }

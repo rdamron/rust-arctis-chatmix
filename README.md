@@ -1,4 +1,4 @@
-# arctis-chatmix
+# rust-arctis-chatmix
 
 ChatMix for the SteelSeries **Arctis Nova Pro Wireless** on Linux — the thing
 SteelSeries Sonar does on Windows, in a single 500 KB static binary with no
@@ -38,7 +38,7 @@ Fedora, and virtually everywhere PipeWire is). No root, no distro-specific
 anything.
 
 ```sh
-git clone <this repo> && cd arctis-chatmix
+git clone <this repo> && cd rust-arctis-chatmix
 ./install.sh
 ```
 
@@ -46,7 +46,7 @@ That's it. The script:
 
 1. Builds the binary if you have Rust, otherwise uses the prebuilt static
    binary in `dist/` (no toolchain needed).
-2. Installs it to `~/.local/bin/arctis-chatmix`.
+2. Installs it to `~/.local/bin/rust-arctis-chatmix`.
 3. Installs and enables a systemd **user** service, so it starts at every
    login/boot. On Bazzite this includes **Game Mode**: the user session starts
    at auto-login whether you land in gamescope or the desktop, so the daemon
@@ -64,11 +64,11 @@ Uninstall with `./install.sh --uninstall`.
 ### Manual install
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-musl   # or use dist/arctis-chatmix
-install -Dm755 target/x86_64-unknown-linux-musl/release/arctis-chatmix ~/.local/bin/arctis-chatmix
-install -Dm644 packaging/arctis-chatmix.service ~/.config/systemd/user/arctis-chatmix.service
+cargo build --release --target x86_64-unknown-linux-musl   # or use dist/rust-arctis-chatmix
+install -Dm755 target/x86_64-unknown-linux-musl/release/rust-arctis-chatmix ~/.local/bin/rust-arctis-chatmix
+install -Dm644 packaging/rust-arctis-chatmix.service ~/.config/systemd/user/rust-arctis-chatmix.service
 systemctl --user daemon-reload
-systemctl --user enable --now arctis-chatmix
+systemctl --user enable --now rust-arctis-chatmix
 ```
 
 ## Usage
@@ -84,8 +84,8 @@ Once running you shouldn't need to touch it. Daily driving:
 Extras:
 
 ```sh
-arctis-chatmix status      # battery, charge slot, mic, ANC, wireless, ...
-journalctl --user -u arctis-chatmix -f    # watch the daemon
+rust-arctis-chatmix status      # battery, charge slot, mic, ANC, wireless, ...
+journalctl --user -u rust-arctis-chatmix -f    # watch the daemon
 ```
 
 Flags (edit `ExecStart` in the unit to use them):
@@ -96,8 +96,8 @@ Flags (edit `ExecStart` in the unit to use them):
 ## Troubleshooting
 
 - **Wheel button doesn't switch to ChatMix** — the enable handshake is sent
-  when the daemon (re)connects; `systemctl --user restart arctis-chatmix`.
-- **No sinks appear** — `journalctl --user -u arctis-chatmix -n 20`. "waiting
+  when the daemon (re)connects; `systemctl --user restart rust-arctis-chatmix`.
+- **No sinks appear** — `journalctl --user -u rust-arctis-chatmix -n 20`. "waiting
   for base station" means the dock isn't detected on USB; "waiting for Arctis
   audio sink" means PipeWire doesn't show the dock's audio device (check the
   card's profile isn't off).

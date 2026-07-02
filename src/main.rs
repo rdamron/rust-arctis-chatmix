@@ -1,18 +1,18 @@
-//! ChatMix daemon for the SteelSeries Arctis Nova Pro Wireless base station.
+//! ChatMix daemon for SteelSeries Arctis headsets.
 //!
 //! Creates two virtual PipeWire sinks ("Arctis Game" / "Arctis Chat") routed to the
-//! headset's real sink, then listens on the base station's HID interface for ChatMix
-//! wheel events and applies them as the two sinks' volumes. Self-heals when the
+//! headset's real sink, then listens on the device's HID interface for ChatMix
+//! dial events and applies them as the two sinks' volumes. Self-heals when the
 //! audio device disappears (headset off, profile disabled, PipeWire restart,
 //! USB unplug, suspend/resume) and hands the default sink back while the
 //! headset is powered off.
 //!
-//! Protocol reference: https://github.com/elegos/Linux-Arctis-Manager
-//! (devices/nova_pro_wireless.yaml): commands are 64 bytes zero-padded, sent on USB
-//! interface 4; wheel events are input reports starting 0x07 0x45 with
-//! byte 2 = game mix (0-100) and byte 3 = chat mix (0-100).
+//! Supported devices are described by the spec table in `devices.rs`;
+//! protocol reference: https://github.com/elegos/Linux-Arctis-Manager.
 
-use std::fs::{self, OpenOptions};
+mod devices;
+
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -20,11 +20,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const VENDOR_ID: u32 = 0x1038;
-const PRODUCT_IDS: [u32; 3] = [0x12e0, 0x12e5, 0x225d];
-const HID_INTERFACE: u32 = 4;
-const REPORT_LEN: usize = 64;
-const STATUS_REQUEST: [u8; 2] = [0x06, 0xb0];
+use devices::{frame_command, parse_report, Collected, DeviceSpec, Field, REPORT_LEN, SPECS, VENDOR_ID};
 
 const GAME_SINK: &str = "arctis_game";
 const CHAT_SINK: &str = "arctis_chat";
@@ -33,37 +29,10 @@ const CHAT_DESC: &str = "Arctis Chat";
 
 /// How often to verify the real sink and virtual sinks still exist.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(3);
-/// How often to ask the base station for a status report (battery, power).
-const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Battery levels are 0-8; warn at <=2 (25%), clear at >=4 or when charging.
-const LOW_BATTERY_WARN: u8 = 2;
-const LOW_BATTERY_CLEAR: u8 = 4;
-
-/// Init handshake from Linux-Arctis-Manager's nova_pro_wireless.yaml `device_init`,
-/// minus the commands that would overwrite on-device settings (EQ 0x33/0x2e,
-/// wireless mode 0xc3, auto-shutdown 0xc1, mic volume 0x37, gain 0x27,
-/// sidetone 0x39, mic LED 0xbf). The important ones: 0x8d 0x01 enables Sonar
-/// mode and 0x49 0x01 enables ChatMix — without them the wheel button won't
-/// switch the base station into game/chat mixing.
-const INIT_COMMANDS: &[&[u8]] = &[
-    &[0x06, 0x20],
-    &[0x06, 0x10],
-    &[0x06, 0x3b],
-    &[0x06, 0x8d, 0x01],
-    &[0x06, 0x80],
-    &[0x06, 0x85, 0x0a],
-    &[0x06, 0xb2],
-    &[0x06, 0x47, 0x64, 0x00, 0x64],
-    &[0x06, 0x83, 0x01],
-    &[0x06, 0x89, 0x00],
-    &[0x06, 0xb3, 0x00],
-    &[0x06, 0x43, 0x01],
-    &[0x06, 0x69, 0x00],
-    &[0x06, 0x3b, 0x00],
-    &[0x06, 0x8d, 0x01],
-    &[0x06, 0x49, 0x01],
-    &[0x06, 0xb7, 0x00],
-];
+/// Warn when the battery falls to this percentage; clear once it recovers
+/// past the higher bound (or the headset is charging).
+const LOW_BATTERY_WARN_PCT: u32 = 25;
+const LOW_BATTERY_CLEAR_PCT: u32 = 50;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -92,11 +61,11 @@ fn log_verbose(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// HID device discovery and report parsing
+// HID device discovery and I/O
 // ---------------------------------------------------------------------------
 
-fn hid_ids() -> Vec<String> {
-    PRODUCT_IDS
+fn hid_ids(spec: &DeviceSpec) -> Vec<String> {
+    spec.product_ids
         .iter()
         .map(|p| format!("0003:{:08X}:{:08X}", VENDOR_ID, p))
         .collect()
@@ -117,151 +86,79 @@ fn uevent_matches(content: &str, ids: &[String], phys_suffix: &str) -> bool {
     id_match && phys_match
 }
 
-fn find_hidraw() -> Option<PathBuf> {
-    let ids = hid_ids();
-    let phys_suffix = format!("/input{}", HID_INTERFACE);
-    for entry in fs::read_dir("/sys/class/hidraw").ok()?.flatten() {
-        let uevent = entry.path().join("device/uevent");
-        let Ok(content) = fs::read_to_string(&uevent) else {
-            continue;
-        };
-        if uevent_matches(&content, &ids, &phys_suffix) {
-            return Some(PathBuf::from("/dev").join(entry.file_name()));
+/// A discovered device: the hidraw node commands are written to, plus any
+/// extra read-only nodes dial events may arrive on (some models split
+/// status and dial reports across USB interfaces).
+struct FoundDevice {
+    spec: &'static DeviceSpec,
+    command: PathBuf,
+    extra_listen: Vec<PathBuf>,
+}
+
+fn find_hidraw() -> Option<FoundDevice> {
+    let entries: Vec<(String, String)> = fs::read_dir("/sys/class/hidraw")
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let content = fs::read_to_string(e.path().join("device/uevent")).ok()?;
+            Some((e.file_name().to_string_lossy().into_owned(), content))
+        })
+        .collect();
+
+    for (name, content) in &entries {
+        for spec in SPECS {
+            let ids = hid_ids(spec);
+            if !uevent_matches(content, &ids, &format!("/input{}", spec.command_interface)) {
+                continue;
+            }
+            // Sibling interfaces of the *same physical device*: same
+            // HID_PHYS up to the trailing /input<N>.
+            let phys_base = content
+                .lines()
+                .find_map(|l| l.strip_prefix("HID_PHYS="))
+                .and_then(|p| p.rsplit_once("/input"))
+                .map(|(base, _)| base.to_string())
+                .unwrap_or_default();
+            let extra_listen = spec
+                .extra_listen_interfaces
+                .iter()
+                .filter_map(|iface| {
+                    let suffix = format!("{phys_base}/input{iface}");
+                    entries
+                        .iter()
+                        .find(|(n, c)| {
+                            n != name
+                                && uevent_matches(c, &ids, &suffix)
+                        })
+                        .map(|(n, _)| PathBuf::from("/dev").join(n))
+                })
+                .collect();
+            return Some(FoundDevice {
+                spec,
+                command: PathBuf::from("/dev").join(name),
+                extra_listen,
+            });
         }
     }
     None
 }
 
-/// ChatMix wheel report: 07 45 <game 0-100> <chat 0-100>.
-fn parse_wheel(report: &[u8]) -> Option<(u8, u8)> {
-    if report.len() >= 4 && report[0] == 0x07 && report[1] == 0x45 {
-        Some((report[2].min(100), report[3].min(100)))
-    } else {
-        None
-    }
-}
-
-/// Parsed 06 b0 status report. Byte offsets and value meanings from
-/// nova_pro_wireless.yaml `status.response_mapping` / `status_parse`.
-#[derive(Debug, PartialEq)]
-struct HeadsetStatus {
-    bt_powerup: u8,
-    bt_auto_mute: u8,
-    bt_power: u8,
-    bt_connection: u8,
-    battery: u8,      // 0-8
-    slot_battery: u8, // 0-8
-    transparent_level: u8,
-    mic_muted: bool,
-    noise_cancelling: u8,
-    auto_off: u8,
-    wireless_mode: u8,
-    pairing: u8,
-    power: u8,
-}
-
-impl HeadsetStatus {
-    fn parse(report: &[u8]) -> Option<Self> {
-        if report.len() < 16 || report[0] != 0x06 || report[1] != 0xb0 {
-            return None;
+/// Write a command with the spec's report framing. Some devices' framing is
+/// untested: if the kernel rejects the report id layout (EINVAL), flip
+/// between numbered/unnumbered framing once and remember what worked.
+fn write_command(dev: &mut File, cmd: &[u8], unnumbered: &mut bool) -> std::io::Result<()> {
+    match dev.write(&frame_command(cmd, *unnumbered)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            *unnumbered = !*unnumbered;
+            log(&format!(
+                "hidraw rejected write, switching to {} report framing",
+                if *unnumbered { "unnumbered" } else { "numbered" }
+            ));
+            dev.write(&frame_command(cmd, *unnumbered)).map(|_| ())
         }
-        Some(Self {
-            bt_powerup: report[2],
-            bt_auto_mute: report[3],
-            bt_power: report[4],
-            bt_connection: report[5],
-            battery: report[6].min(8),
-            slot_battery: report[7].min(8),
-            transparent_level: report[8],
-            mic_muted: report[9] == 0x01,
-            noise_cancelling: report[10],
-            auto_off: report[12],
-            wireless_mode: report[13],
-            pairing: report[14],
-            power: report[15],
-        })
+        Err(e) => Err(e),
     }
-
-    fn is_online(&self) -> bool {
-        self.power == 0x08
-    }
-
-    fn is_charging(&self) -> bool {
-        self.power == 0x02
-    }
-
-    fn battery_percent(&self) -> u32 {
-        self.battery as u32 * 100 / 8
-    }
-
-    fn slot_battery_percent(&self) -> u32 {
-        self.slot_battery as u32 * 100 / 8
-    }
-
-    fn power_str(&self) -> &'static str {
-        match self.power {
-            0x01 => "offline",
-            0x02 => "charging via cable",
-            0x08 => "online",
-            _ => "unknown",
-        }
-    }
-
-    fn anc_str(&self) -> &'static str {
-        match self.noise_cancelling {
-            0x00 => "off",
-            0x01 => "transparent",
-            0x02 => "on",
-            _ => "unknown",
-        }
-    }
-
-    fn wireless_mode_str(&self) -> &'static str {
-        match self.wireless_mode {
-            0x00 => "speed",
-            0x01 => "range",
-            _ => "unknown",
-        }
-    }
-
-    fn pairing_str(&self) -> &'static str {
-        match self.pairing {
-            0x01 => "not paired",
-            0x04 => "paired (offline)",
-            0x08 => "connected",
-            _ => "unknown",
-        }
-    }
-
-    fn auto_off_str(&self) -> String {
-        match self.auto_off {
-            0x00 => "never".to_string(),
-            0x01 => "1 minute".to_string(),
-            0x02 => "5 minutes".to_string(),
-            0x03 => "10 minutes".to_string(),
-            0x04 => "15 minutes".to_string(),
-            0x05 => "30 minutes".to_string(),
-            0x06 => "60 minutes".to_string(),
-            v => format!("unknown ({v:#04x})"),
-        }
-    }
-
-    fn bluetooth_str(&self) -> &'static str {
-        if self.bt_power != 0x00 {
-            return "off";
-        }
-        match self.bt_connection {
-            0x01 => "on, connected",
-            0x02 => "on, disconnected",
-            _ => "on",
-        }
-    }
-}
-
-fn pad_command(cmd: &[u8]) -> [u8; REPORT_LEN] {
-    let mut report = [0u8; REPORT_LEN];
-    report[..cmd.len()].copy_from_slice(cmd);
-    report
 }
 
 /// True if the fd has data or an error condition pending (either way, the next
@@ -273,6 +170,19 @@ fn poll_ready(fd: i32, timeout_ms: i32) -> bool {
         revents: 0,
     };
     unsafe { libc::poll(&mut pfd, 1, timeout_ms) > 0 && pfd.revents != 0 }
+}
+
+/// True if any of the fds has data or an error pending.
+fn poll_any(fds: &[i32], timeout_ms: i32) -> bool {
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) > 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +211,7 @@ struct SinkSnapshot {
     real: Option<String>,
 }
 
-fn snapshot_sinks() -> Option<SinkSnapshot> {
+fn snapshot_sinks(spec: &DeviceSpec) -> Option<SinkSnapshot> {
     let json = pactl(&["-f", "json", "list", "sinks"]).ok()?;
     let sinks: serde_json::Value = serde_json::from_str(&json).ok()?;
     let mut snap = SinkSnapshot {
@@ -320,7 +230,10 @@ fn snapshot_sinks() -> Option<SinkSnapshot> {
         let vendor = props["device.vendor.id"].as_str().unwrap_or("");
         let product = props["device.product.id"].as_str().unwrap_or("");
         if vendor == format!("{:#06x}", VENDOR_ID)
-            && PRODUCT_IDS.iter().any(|p| product == format!("{:#06x}", p))
+            && spec
+                .product_ids
+                .iter()
+                .any(|p| product == format!("{:#06x}", p))
         {
             snap.real = Some(name.to_string());
         }
@@ -388,7 +301,11 @@ impl Sinks {
             load_module(&[
                 "module-null-sink",
                 &format!("sink_name={name}"),
-                &format!("sink_properties=node.description=\"{escaped}\""),
+                // node.nick is what Steam Game Mode displays; it falls back to
+                // the raw node.name if unset. Desktop tools use node.description.
+                &format!(
+                    "sink_properties=node.description=\"{escaped}\" node.nick=\"{escaped}\""
+                ),
             ])?;
             load_module(&[
                 "module-loopback",
@@ -413,26 +330,30 @@ fn set_mix(game: u8, chat: u8) {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    spec: &'static DeviceSpec,
     sinks: Option<Sinks>,
     /// Default sink before we claimed it; restored when the headset powers
     /// off and on exit.
     prev_default: Option<String>,
     manage_default: bool,
     last_mix: (u8, u8),
-    /// None until the first status report.
+    /// None until the first status report carrying a Power field.
     online: Option<bool>,
+    battery_pct: Option<u32>,
     battery_warned: bool,
     warned_no_sink: bool,
 }
 
 impl Session {
-    fn new(manage_default: bool) -> Self {
+    fn new(spec: &'static DeviceSpec, manage_default: bool) -> Self {
         Self {
+            spec,
             sinks: None,
             prev_default: None,
             manage_default,
             last_mix: (100, 100),
             online: None,
+            battery_pct: None,
             battery_warned: false,
             warned_no_sink: false,
         }
@@ -468,7 +389,7 @@ impl Session {
     /// alive, (re)creating them as needed. Handles first-time setup, the audio
     /// device disappearing (profile off / unplug), and PipeWire restarts.
     fn ensure_sinks(&mut self) {
-        let Some(snap) = snapshot_sinks() else {
+        let Some(snap) = snapshot_sinks(self.spec) else {
             return; // pactl unavailable right now (pipewire restarting); retry next tick
         };
 
@@ -514,7 +435,10 @@ impl Session {
         }
     }
 
-    fn handle_wheel(&mut self, game: u8, chat: u8) {
+    fn handle_mix(&mut self, game: u8, chat: u8) {
+        if (game, chat) == self.last_mix {
+            return;
+        }
         self.last_mix = (game, chat);
         if self.sinks.is_some() {
             set_mix(game, chat);
@@ -522,50 +446,60 @@ impl Session {
         }
     }
 
-    fn handle_status(&mut self, st: &HeadsetStatus) {
-        let is_online = st.is_online();
-        match self.online {
-            None => log(&format!(
-                "headset {}, battery {}%",
-                st.power_str(),
-                st.battery_percent()
-            )),
-            Some(prev) if prev != is_online => {
-                if is_online {
-                    log(&format!(
-                        "headset powered on (battery {}%), claiming default sink",
-                        st.battery_percent()
-                    ));
-                    set_mix(self.last_mix.0, self.last_mix.1);
-                    self.claim_default();
-                } else {
-                    log(&format!(
-                        "headset {} , releasing default sink",
-                        st.power_str()
-                    ));
-                    self.release_default();
-                }
-            }
-            _ => {}
+    fn battery_str(&self) -> String {
+        match self.battery_pct {
+            Some(pct) => format!("battery {pct}%"),
+            None => "battery unknown".to_string(),
         }
-        self.online = Some(is_online);
+    }
 
-        if is_online && st.battery <= LOW_BATTERY_WARN && !self.battery_warned {
-            let pct = st.battery_percent();
-            log(&format!("LOW BATTERY: headset at {pct}%"));
-            let _ = Command::new("notify-send")
-                .args([
-                    "-u",
-                    "critical",
-                    "-a",
-                    "rust-arctis-chatmix",
-                    "Arctis headset battery low",
-                    &format!("{pct}% remaining"),
-                ])
-                .status();
-            self.battery_warned = true;
-        } else if st.battery >= LOW_BATTERY_CLEAR || st.is_charging() {
-            self.battery_warned = false;
+    fn apply_status(&mut self, fields: &Collected) {
+        if let Some(b) = fields.get(Field::Battery) {
+            self.battery_pct = Some(self.spec.battery_percent(b));
+        }
+        let charging = self.spec.is_charging(fields);
+
+        if let Some(p) = fields.get(Field::Power) {
+            let is_online = self.spec.is_online(p);
+            let power_str = (self.spec.describe)(fields, Field::Power)
+                .unwrap_or_else(|| format!("power state {p:#04x}"));
+            match self.online {
+                None => log(&format!("headset {}, {}", power_str, self.battery_str())),
+                Some(prev) if prev != is_online => {
+                    if is_online {
+                        log(&format!(
+                            "headset powered on ({}), claiming default sink",
+                            self.battery_str()
+                        ));
+                        set_mix(self.last_mix.0, self.last_mix.1);
+                        self.claim_default();
+                    } else {
+                        log(&format!("headset {power_str}, releasing default sink"));
+                        self.release_default();
+                    }
+                }
+                _ => {}
+            }
+            self.online = Some(is_online);
+        }
+
+        if let Some(pct) = self.battery_pct {
+            if self.online != Some(false) && pct <= LOW_BATTERY_WARN_PCT && !self.battery_warned {
+                log(&format!("LOW BATTERY: headset at {pct}%"));
+                let _ = Command::new("notify-send")
+                    .args([
+                        "-u",
+                        "critical",
+                        "-a",
+                        "rust-arctis-chatmix",
+                        "Arctis headset battery low",
+                        &format!("{pct}% remaining"),
+                    ])
+                    .status();
+                self.battery_warned = true;
+            } else if pct >= LOW_BATTERY_CLEAR_PCT || charging {
+                self.battery_warned = false;
+            }
         }
     }
 
@@ -578,33 +512,55 @@ impl Session {
     }
 }
 
-/// One connected session: init the dock, keep sinks healthy, pump wheel events
-/// until the device goes away or we're told to stop.
+/// One connected session: init the device, keep sinks healthy, pump ChatMix
+/// events until the device goes away or we're told to stop.
 /// Returns Ok(true) to reconnect, Ok(false) to exit.
-fn run_session(hidraw: &PathBuf, manage_default: bool) -> Result<bool, String> {
+fn run_session(found: &FoundDevice, manage_default: bool) -> Result<bool, String> {
+    let spec = found.spec;
     let mut dev = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(hidraw)
-        .map_err(|e| format!("cannot open {}: {e}", hidraw.display()))?;
-    let fd = dev.as_raw_fd();
+        .open(&found.command)
+        .map_err(|e| format!("cannot open {}: {e}", found.command.display()))?;
+    let mut extras: Vec<File> = Vec::new();
+    for path in &found.extra_listen {
+        match OpenOptions::new().read(true).open(path) {
+            Ok(f) => extras.push(f),
+            Err(e) => log(&format!("cannot open {} (ignoring): {e}", path.display())),
+        }
+    }
+    let all_fds: Vec<i32> = std::iter::once(dev.as_raw_fd())
+        .chain(extras.iter().map(|f| f.as_raw_fd()))
+        .collect();
+    let mut unnumbered = spec.unnumbered_reports;
 
-    // Enable Sonar/ChatMix mode on the base station, then ask for a status
-    // report (battery/power); wheel events arrive unsolicited after that.
-    for cmd in INIT_COMMANDS {
-        if let Err(e) = dev.write(&pad_command(cmd)) {
+    // Enable ChatMix mode where the device needs it, then ask for a status
+    // report; dial events arrive unsolicited after that.
+    for cmd in spec.init {
+        if let Err(e) = write_command(&mut dev, cmd, &mut unnumbered) {
             return Err(format!("init command failed: {e}"));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    log("sent ChatMix enable sequence");
-    let status_request = pad_command(&STATUS_REQUEST);
-    let _ = dev.write(&status_request);
+    if !spec.init.is_empty() {
+        log("sent init sequence");
+    }
+    for req in spec.status_requests {
+        let _ = write_command(&mut dev, req, &mut unnumbered);
+    }
+    if !spec.has_chatmix() {
+        log(&format!(
+            "note: no ChatMix protocol is documented for the {}; \
+             providing sinks and status only",
+            spec.name
+        ));
+    }
 
-    let mut session = Session::new(manage_default);
+    let mut session = Session::new(spec, manage_default);
     session.ensure_sinks();
     let mut last_health = Instant::now();
     let mut last_status_poll = Instant::now();
+    let status_poll = Duration::from_secs(spec.status_poll_secs);
 
     let result = loop {
         if !RUNNING.load(Ordering::SeqCst) {
@@ -614,44 +570,59 @@ fn run_session(hidraw: &PathBuf, manage_default: bool) -> Result<bool, String> {
             session.ensure_sinks();
             last_health = Instant::now();
         }
-        if last_status_poll.elapsed() >= STATUS_POLL_INTERVAL {
-            if dev.write(&status_request).is_err() {
+        if spec.has_status() && last_status_poll.elapsed() >= status_poll {
+            let mut failed = false;
+            for req in spec.status_requests {
+                if write_command(&mut dev, req, &mut unnumbered).is_err() {
+                    failed = true;
+                }
+            }
+            if failed {
                 log("device write failed, assuming disconnect");
                 break Ok(true);
             }
             last_status_poll = Instant::now();
         }
-        if !poll_ready(fd, 250) {
+        if !poll_any(&all_fds, 250) {
             continue;
         }
 
         let mut mix: Option<(u8, u8)> = None;
         let mut device_gone = false;
-        // Drain everything pending so a fast wheel spin coalesces into one
-        // pactl update instead of one per report.
-        loop {
-            let mut report = [0u8; REPORT_LEN];
-            match dev.read(&mut report) {
-                Ok(n) => {
-                    if let Some(m) = parse_wheel(&report[..n]) {
-                        mix = Some(m);
-                    } else if let Some(st) = HeadsetStatus::parse(&report[..n]) {
-                        session.handle_status(&st);
+        // Drain everything pending on every node so a fast dial spin
+        // coalesces into one pactl update instead of one per report.
+        for file in std::iter::once(&mut dev).chain(extras.iter_mut()) {
+            let fd = file.as_raw_fd();
+            while poll_ready(fd, 0) {
+                let mut report = [0u8; REPORT_LEN + 1];
+                match file.read(&mut report) {
+                    Ok(n) => {
+                        let fields = parse_report(spec, &report[..n]);
+                        if let (Some(g), Some(c)) =
+                            (fields.get(Field::GameMix), fields.get(Field::ChatMix))
+                        {
+                            mix = Some((g.min(100), c.min(100)));
+                        }
+                        if fields.get(Field::Power).is_some()
+                            || fields.get(Field::Battery).is_some()
+                        {
+                            session.apply_status(&fields);
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!("device read failed ({e}), assuming disconnect"));
+                        device_gone = true;
+                        break;
                     }
                 }
-                Err(e) => {
-                    log(&format!("device read failed ({e}), assuming disconnect"));
-                    device_gone = true;
-                    break;
-                }
             }
-            if !poll_ready(fd, 0) {
+            if device_gone {
                 break;
             }
         }
 
         if let Some((game, chat)) = mix {
-            session.handle_wheel(game, chat);
+            session.handle_mix(game, chat);
         }
         if device_gone {
             break Ok(true); // tear down and let main retry
@@ -666,61 +637,109 @@ fn run_session(hidraw: &PathBuf, manage_default: bool) -> Result<bool, String> {
 // `status` subcommand
 // ---------------------------------------------------------------------------
 
+/// Ordered, labelled fields for `status` output. Numeric fields (battery,
+/// chatmix) are rendered specially; everything else goes through the spec's
+/// describe fn.
+const STATUS_LINES: &[(Field, &str)] = &[
+    (Field::Power, "headset"),
+    (Field::Battery, "battery"),
+    (Field::SlotBattery, "charge slot"),
+    (Field::MicMuted, "microphone"),
+    (Field::GameMix, "chatmix"),
+    (Field::Anc, "anc"),
+    (Field::WirelessMode, "wireless"),
+    (Field::BtConnection, "bluetooth"),
+    (Field::BtAutoMute, "bt auto-mute"),
+    (Field::AutoOff, "auto off"),
+    (Field::Gain, "gain"),
+    (Field::MicVolume, "mic volume"),
+    (Field::SideTone, "sidetone"),
+    (Field::LineOut, "line out"),
+];
+
+fn print_status(spec: &DeviceSpec, fields: &Collected) {
+    println!("{:<14}{}", "device:", spec.name);
+    for &(field, label) in STATUS_LINES {
+        let Some(raw) = fields.get(field) else {
+            continue;
+        };
+        let value = match field {
+            Field::Battery => format!(
+                "{}%{}",
+                spec.battery_percent(raw),
+                if spec.is_charging(fields) { " (charging)" } else { "" }
+            ),
+            Field::SlotBattery => format!("{}%", spec.battery_percent(raw)),
+            Field::MicMuted => (if raw == 0x01 { "muted" } else { "unmuted" }).to_string(),
+            Field::GameMix => match fields.get(Field::ChatMix) {
+                Some(chat) => format!("game {}% / chat {}%", raw.min(100), chat.min(100)),
+                None => continue,
+            },
+            _ => match (spec.describe)(fields, field) {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        println!("{:<14}{}", format!("{label}:"), value);
+    }
+}
+
 fn cmd_status() -> i32 {
-    let Some(hidraw) = find_hidraw() else {
-        eprintln!("rust-arctis-chatmix: base station not found (is it plugged in?)");
+    let Some(found) = find_hidraw() else {
+        eprintln!("rust-arctis-chatmix: no supported Arctis device found (is it plugged in?)");
         return 1;
     };
-    let mut dev = match OpenOptions::new().read(true).write(true).open(&hidraw) {
+    let spec = found.spec;
+    let mut dev = match OpenOptions::new().read(true).write(true).open(&found.command) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("rust-arctis-chatmix: cannot open {}: {e}", hidraw.display());
+            eprintln!(
+                "rust-arctis-chatmix: cannot open {}: {e}",
+                found.command.display()
+            );
             return 1;
         }
     };
-    if dev.write(&pad_command(&STATUS_REQUEST)).is_err() {
-        eprintln!("rust-arctis-chatmix: failed to send status request");
+    if !spec.has_status() {
+        eprintln!("rust-arctis-chatmix: the {} has no status protocol", spec.name);
         return 1;
     }
+    let mut unnumbered = spec.unnumbered_reports;
+    for req in spec.status_requests {
+        if write_command(&mut dev, req, &mut unnumbered).is_err() {
+            eprintln!("rust-arctis-chatmix: failed to send status request");
+            return 1;
+        }
+    }
 
+    // Some devices answer with several frames (the Elite spreads status over
+    // half a dozen); collect until the device goes quiet or we time out.
     let fd = dev.as_raw_fd();
+    let mut fields = Collected::default();
     let deadline = Instant::now() + Duration::from_secs(2);
+    let mut got_any = false;
     while Instant::now() < deadline {
-        if !poll_ready(fd, 200) {
+        let wait_ms = if got_any { 300 } else { 200 };
+        if !poll_ready(fd, wait_ms) {
+            if got_any {
+                break; // device went quiet, we have our answer
+            }
             continue;
         }
-        let mut report = [0u8; REPORT_LEN];
+        let mut report = [0u8; REPORT_LEN + 1];
         let Ok(n) = dev.read(&mut report) else { break };
-        let Some(st) = HeadsetStatus::parse(&report[..n]) else {
-            continue; // some other report (wheel etc.), keep waiting
-        };
-        println!("headset:      {}", st.power_str());
-        println!(
-            "battery:      {}%{}",
-            st.battery_percent(),
-            if st.is_charging() { " (charging)" } else { "" }
-        );
-        println!("charge slot:  {}%", st.slot_battery_percent());
-        println!(
-            "microphone:   {}",
-            if st.mic_muted { "muted" } else { "unmuted" }
-        );
-        println!(
-            "anc:          {} (transparency level {}/10)",
-            st.anc_str(),
-            st.transparent_level
-        );
-        println!(
-            "wireless:     {} mode, {}",
-            st.wireless_mode_str(),
-            st.pairing_str()
-        );
-        println!("bluetooth:    {}", st.bluetooth_str());
-        println!("auto off:     {}", st.auto_off_str());
-        return 0;
+        let parsed = parse_report(spec, &report[..n]);
+        if !parsed.is_empty() {
+            fields.merge(&parsed);
+            got_any = true;
+        }
     }
-    eprintln!("rust-arctis-chatmix: no status response from base station");
-    1
+    if !got_any {
+        eprintln!("rust-arctis-chatmix: no status response from the device");
+        return 1;
+    }
+    print_status(spec, &fields);
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -729,17 +748,21 @@ fn cmd_status() -> i32 {
 
 fn usage() {
     println!(
-        "rust-arctis-chatmix — ChatMix daemon for the Arctis Nova Pro Wireless\n\
+        "rust-arctis-chatmix — ChatMix daemon for SteelSeries Arctis headsets\n\
          \n\
          usage: rust-arctis-chatmix [--verbose] [--no-default-sink]\n\
          \x20      rust-arctis-chatmix status\n\
          \n\
          Runs as a daemon: creates the Arctis Game / Arctis Chat PipeWire sinks\n\
-         and maps the base station's ChatMix wheel onto their volumes.\n\
+         and maps the device's ChatMix dial onto their volumes.\n\
          \n\
-         status              one-shot query: battery, power, mic, ANC, ...\n\
+         Supported: Nova Pro Wireless, Nova Pro (GameDAC Gen 2), Nova 7 family,\n\
+         Arctis 7+, Nova Elite, Nova 5 (sinks/status only). Only the Nova Pro\n\
+         Wireless has been verified on real hardware.\n\
+         \n\
+         status              one-shot query: battery, power, mic, ...\n\
          --no-default-sink   never touch the default sink\n\
-         --verbose, -v       log every wheel adjustment\n\
+         --verbose, -v       log every dial adjustment\n\
          --help, -h          this text"
     );
 }
@@ -771,18 +794,31 @@ fn main() {
 
     let mut announced_wait = false;
     while RUNNING.load(Ordering::SeqCst) {
-        let Some(hidraw) = find_hidraw() else {
+        let Some(found) = find_hidraw() else {
             if !announced_wait {
-                log("waiting for Arctis Nova Pro Wireless base station...");
+                log("waiting for a supported Arctis device...");
                 announced_wait = true;
             }
             std::thread::sleep(Duration::from_secs(2));
             continue;
         };
         announced_wait = false;
-        log(&format!("found base station at {}", hidraw.display()));
+        log(&format!(
+            "found {} at {}{}",
+            found.spec.name,
+            found.command.display(),
+            if found.extra_listen.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (+{} listen node{})",
+                    found.extra_listen.len(),
+                    if found.extra_listen.len() == 1 { "" } else { "s" }
+                )
+            }
+        ));
 
-        match run_session(&hidraw, manage_default) {
+        match run_session(&found, manage_default) {
             Ok(true) => std::thread::sleep(Duration::from_secs(2)), // reconnect
             Ok(false) => break,                                     // signal
             Err(e) => {
@@ -801,6 +837,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devices::NOVA_PRO_WIRELESS;
 
     // Captured live from an Arctis Nova Pro Wireless base station.
     const REAL_UEVENT: &str = "DRIVER=hid-generic\n\
@@ -812,78 +849,33 @@ mod tests {
 
     #[test]
     fn uevent_matches_real_device() {
-        assert!(uevent_matches(REAL_UEVENT, &hid_ids(), "/input4"));
+        assert!(uevent_matches(REAL_UEVENT, &hid_ids(&NOVA_PRO_WIRELESS), "/input4"));
     }
 
     #[test]
     fn uevent_rejects_wrong_interface() {
-        assert!(!uevent_matches(REAL_UEVENT, &hid_ids(), "/input3"));
+        assert!(!uevent_matches(REAL_UEVENT, &hid_ids(&NOVA_PRO_WIRELESS), "/input3"));
     }
 
     #[test]
     fn uevent_rejects_other_device() {
         let other = REAL_UEVENT.replace("1038", "1532");
-        assert!(!uevent_matches(&other, &hid_ids(), "/input4"));
+        assert!(!uevent_matches(&other, &hid_ids(&NOVA_PRO_WIRELESS), "/input4"));
     }
 
     #[test]
-    fn wheel_report_parses() {
-        let mut report = [0u8; REPORT_LEN];
-        report[..4].copy_from_slice(&[0x07, 0x45, 60, 100]);
-        assert_eq!(parse_wheel(&report), Some((60, 100)));
-    }
-
-    #[test]
-    fn wheel_report_clamps_out_of_range() {
-        let report = [0x07, 0x45, 200, 101];
-        assert_eq!(parse_wheel(&report), Some((100, 100)));
-    }
-
-    #[test]
-    fn wheel_rejects_other_reports() {
-        assert_eq!(parse_wheel(&[0x06, 0xb0, 0, 0]), None);
-        assert_eq!(parse_wheel(&[0x07, 0x25, 10, 0]), None);
-        assert_eq!(parse_wheel(&[0x07]), None);
-    }
-
-    // Captured live: headset online, battery 7/8, ANC off, mic unmuted,
-    // 30 min auto-off, range mode, paired+connected.
-    const REAL_STATUS: [u8; 16] = [
-        0x06, 0xb0, 0x00, 0x00, 0x01, 0x00, 0x07, 0x08, 0x01, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x08,
-        0x08,
-    ];
-
-    #[test]
-    fn status_report_parses() {
-        let st = HeadsetStatus::parse(&REAL_STATUS).unwrap();
-        assert!(st.is_online());
-        assert!(!st.is_charging());
-        assert_eq!(st.battery, 7);
-        assert_eq!(st.battery_percent(), 87);
-        assert_eq!(st.slot_battery_percent(), 100);
-        assert!(!st.mic_muted);
-        assert_eq!(st.anc_str(), "off");
-        assert_eq!(st.wireless_mode_str(), "range");
-        assert_eq!(st.pairing_str(), "connected");
-        assert_eq!(st.auto_off_str(), "30 minutes");
-        assert_eq!(st.power_str(), "online");
-    }
-
-    #[test]
-    fn status_battery_bounds() {
-        let mut r = REAL_STATUS;
-        r[6] = 0;
-        assert_eq!(HeadsetStatus::parse(&r).unwrap().battery_percent(), 0);
-        r[6] = 8;
-        assert_eq!(HeadsetStatus::parse(&r).unwrap().battery_percent(), 100);
-        r[6] = 200; // defensive clamp
-        assert_eq!(HeadsetStatus::parse(&r).unwrap().battery_percent(), 100);
-    }
-
-    #[test]
-    fn status_rejects_other_reports() {
-        assert_eq!(HeadsetStatus::parse(&[0x07, 0x45, 50, 50]), None);
-        assert_eq!(HeadsetStatus::parse(&REAL_STATUS[..8]), None);
+    fn uevent_matches_only_its_own_spec() {
+        // A Nova 7 on interface 3 must not match the Nova Pro spec and
+        // vice versa.
+        let nova7 = REAL_UEVENT
+            .replace("12E0", "22A1")
+            .replace("input4", "input3");
+        assert!(!uevent_matches(&nova7, &hid_ids(&NOVA_PRO_WIRELESS), "/input4"));
+        assert!(uevent_matches(
+            &nova7,
+            &hid_ids(&devices::NOVA_7_PERCENT),
+            "/input3"
+        ));
     }
 
     #[test]
@@ -896,16 +888,5 @@ mod tests {
         assert_eq!(parse_module_line("not-a-number\tname\targ"), None);
         // Modules can legitimately have no argument column.
         assert_eq!(parse_module_line("12\tmodule-x"), Some(("12", "")));
-    }
-
-    #[test]
-    fn commands_fit_report() {
-        for cmd in INIT_COMMANDS {
-            assert!(cmd.len() <= REPORT_LEN);
-        }
-        let padded = pad_command(&STATUS_REQUEST);
-        assert_eq!(padded.len(), REPORT_LEN);
-        assert_eq!(&padded[..2], &STATUS_REQUEST);
-        assert!(padded[2..].iter().all(|&b| b == 0));
     }
 }

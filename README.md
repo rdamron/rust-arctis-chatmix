@@ -1,19 +1,43 @@
 # rust-arctis-chatmix
 
-ChatMix for the SteelSeries **Arctis Nova Pro Wireless** on Linux — the thing
-SteelSeries Sonar does on Windows, in a single 500 KB static binary with no
-dependencies.
+> [!WARNING]
+> **⚠️ Disclaimer: this software was developed with AI** (Claude Code) and
+> talks directly to your headset's USB HID interface. Most supported devices
+> have **never been tested on real hardware** (see the table below). It is
+> provided **as is, with no warranty of any kind**, express or implied — no
+> guarantee of merchantability, fitness for a particular purpose, or that it
+> won't misbehave with your device. **Use at your own risk.**
 
-Supports the Nova Pro Wireless and its X variants (USB ids `1038:12e0`,
-`1038:12e5`, `1038:225d`).
+ChatMix for SteelSeries **Arctis** headsets on Linux — the thing SteelSeries
+Sonar does on Windows, in a single 500 KB static binary with no dependencies.
+
+## Supported devices
+
+| Device | USB product ids (`1038:*`) | ChatMix | Status |
+|---|---|---|---|
+| Arctis Nova Pro Wireless (+ X) | `12e0` `12e5` `225d` | ✅ | **tested on real hardware** |
+| Arctis Nova Pro wired (GameDAC Gen 2) | `12cd` `12cb` | ✅ | untested |
+| Arctis Nova 7 / 7X (+ editions) | `2202` `2206` `22a4` `223a` `227a` `22ab` `22a1` `227e` `2258` `229e` `22a9` `22a5` | ✅ | **tested** (Nova 7X Gen 2, `229e`) |
+| Arctis 7+ | `220e` `2212` `2216` `2236` | ✅ | untested |
+| Arctis Nova Elite | `2244` | ✅ | untested |
+| Arctis Nova 5 / 5X | `2232` `2253` `2264` | ⚠️ sinks + battery only¹ | untested |
+
+The untested entries are faithful translations of
+[Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager)'s device
+definitions (see `src/devices.rs`); if you own one, reports either way are very
+welcome.
+
+¹ Upstream documents no ChatMix reports for the Nova 5 family, so the daemon
+provides the two sinks (adjust their volumes manually) plus battery/status.
 
 ## What it does
 
 - Creates two virtual PipeWire sinks, **Arctis Game** (`arctis_game`) and
   **Arctis Chat** (`arctis_chat`), each routed into the headset's real output.
-- Sends the base station the Sonar/ChatMix enable handshake, so **pressing the
-  wheel toggles between volume and ChatMix mode** on the dock's display.
-- Turning the wheel in ChatMix mode adjusts the balance: the dock reports
+- Sends the device the Sonar/ChatMix enable handshake where it needs one (Nova
+  Pro family, Nova Elite), so **pressing the wheel toggles between volume and
+  ChatMix mode** on the dock's display.
+- Turning the dial in ChatMix mode adjusts the balance: the device reports
   game/chat levels (0–100 each) and the daemon applies them as the two sinks'
   volumes.
 - Sets **Arctis Game as the default output** while the headset is on. Move your
@@ -98,19 +122,26 @@ Flags (edit `ExecStart` in the unit to use them):
 - **Wheel button doesn't switch to ChatMix** — the enable handshake is sent
   when the daemon (re)connects; `systemctl --user restart rust-arctis-chatmix`.
 - **No sinks appear** — `journalctl --user -u rust-arctis-chatmix -n 20`. "waiting
-  for base station" means the dock isn't detected on USB; "waiting for Arctis
-  audio sink" means PipeWire doesn't show the dock's audio device (check the
-  card's profile isn't off).
+  for a supported Arctis device" means nothing was detected on USB; "waiting
+  for Arctis audio sink" means PipeWire doesn't show the device's audio output
+  (check the card's profile isn't off).
 - **Permission denied on /dev/hidraw\*** — rerun `./install.sh`; it installs a
   udev rule for exactly this.
 
 ## How it works / credits
 
-The dock speaks a simple HID protocol on USB interface 4 (64-byte zero-padded
-commands): `06 8d 01` + `06 49 01` enable Sonar/ChatMix mode, `06 b0` requests
-a status report, and wheel turns arrive as `07 45 <game> <chat>`. All of it was
-reverse-engineered by the
+Each device speaks a simple HID protocol on a USB interface (4 for the Nova
+Pro family, 3 for the rest; 64-byte zero-padded commands). On the Nova Pro
+Wireless, for example, `06 8d 01` + `06 49 01` enable Sonar/ChatMix mode,
+`06 b0` requests a status report, and wheel turns arrive as
+`07 45 <game> <chat>`. The per-device details live in `src/devices.rs`. All of
+the protocols were reverse-engineered by the
 [Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager) project
-(see `devices/nova_pro_wireless.yaml` there) — this tool is a minimal
-single-binary take on the same idea. Audio plumbing is plain `pactl` against
-pipewire-pulse: `module-null-sink` + `module-loopback`.
+(see its `devices/*.yaml`) — this tool is a minimal single-binary take on the
+same idea. Audio plumbing is plain `pactl` against pipewire-pulse:
+`module-null-sink` + `module-loopback`.
+
+## License
+
+[GPL-3.0](LICENSE), matching Linux-Arctis-Manager: the device protocol tables
+in `src/devices.rs` are translated from that project's device definitions.

@@ -2,8 +2,8 @@
 name = "rust-arctis-chatmix"
 version = "0.1.0"
 edition = "2021"
-description = "ChatMix daemon for SteelSeries Arctis Nova Pro Wireless: creates Game/Chat PipeWire sinks and drives their volumes from the base station wheel"
-license = "MIT"
+description = "ChatMix daemon for SteelSeries Arctis headsets: creates Game/Chat PipeWire sinks and drives their volumes from the ChatMix dial"
+license = "GPL-3.0-only"
 
 [dependencies]
 libc = "0.2"

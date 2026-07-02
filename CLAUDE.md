@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A ChatMix daemon for SteelSeries Arctis headsets: creates two virtual PipeWire
-sinks (`arctis_game`/`arctis_chat`), routes them into the headset's real sink,
+sinks (`Arctis Game`/`Arctis Chat`), routes them into the headset's real sink,
 and drives their volumes from the headset's ChatMix dial via raw hidraw I/O.
 Ships as a single static binary + systemd user service. Protocols are
 translated from [Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager)'s
@@ -94,8 +94,14 @@ Empirical findings that override upstream documentation:
 
 - `pactl -f json list modules` omits module indices — parse
   `pactl list modules short` (tab-separated) to unload modules.
-- Virtual sinks need both `node.description` (desktop tools) and `node.nick`
-  (Steam Game Mode falls back to raw `node.name` without it).
+- Steam Game Mode's audio picker (`CSystemAudioController` in steamui.so,
+  closed source; gamescope has no audio code) shows the card description for
+  hardware sinks, but for card-less sinks (module-null-sink has no card) it
+  shows the raw sink name and ignores `node.nick`/`node.description` entirely.
+  Hence the sink *names* are the display strings "Arctis Game"/"Arctis Chat" —
+  pipewire-pulse accepts names with spaces (they must be quoted inside module
+  argument strings) and pactl addresses them fine. `node.description` is still
+  set for desktop tools.
 - The dev container has no `lsusb`; enumerate USB via
   `/sys/bus/usb/devices/*/idVendor` + `idProduct`, and hidraw nodes via
   `/sys/class/hidraw/*/device/uevent` (HID_ID has vendor/product, HID_PHYS

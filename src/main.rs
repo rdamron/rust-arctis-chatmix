@@ -22,10 +22,17 @@ use std::time::{Duration, Instant};
 
 use devices::{frame_command, parse_report, Collected, DeviceSpec, Field, REPORT_LEN, SPECS, VENDOR_ID};
 
-const GAME_SINK: &str = "arctis_game";
-const CHAT_SINK: &str = "arctis_chat";
+// The sink *name* doubles as the display name: Steam Game Mode's audio picker
+// ignores node.nick/node.description for card-less sinks and shows the raw
+// sink name, so the name itself must be presentable. pipewire-pulse accepts
+// names with spaces and pactl addresses them fine.
+const GAME_SINK: &str = "Arctis Game";
+const CHAT_SINK: &str = "Arctis Chat";
 const GAME_DESC: &str = "Arctis Game";
 const CHAT_DESC: &str = "Arctis Chat";
+/// Sink names used by versions before the Game-Mode rename; still matched
+/// during cleanup so an upgrade tears down a crashed old instance's modules.
+const LEGACY_SINKS: [&str; 2] = ["arctis_game", "arctis_chat"];
 
 /// How often to verify the real sink and virtual sinks still exist.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(3);
@@ -272,7 +279,10 @@ fn unload_our_modules() {
         let Some((index, arg)) = parse_module_line(line) else {
             continue;
         };
-        if arg.contains(GAME_SINK) || arg.contains(CHAT_SINK) {
+        if arg.contains(GAME_SINK)
+            || arg.contains(CHAT_SINK)
+            || LEGACY_SINKS.iter().any(|s| arg.contains(s))
+        {
             let _ = pactl(&["unload-module", index]);
         }
     }
@@ -300,16 +310,17 @@ impl Sinks {
             let escaped = desc.replace(' ', "\\ ");
             load_module(&[
                 "module-null-sink",
-                &format!("sink_name={name}"),
-                // node.nick is what Steam Game Mode displays; it falls back to
-                // the raw node.name if unset. Desktop tools use node.description.
+                // Names contain spaces, so they must be quoted inside the
+                // module argument string. Desktop tools display
+                // node.description; Steam Game Mode shows the raw sink name.
+                &format!("sink_name=\"{name}\""),
                 &format!(
                     "sink_properties=node.description=\"{escaped}\" node.nick=\"{escaped}\""
                 ),
             ])?;
             load_module(&[
                 "module-loopback",
-                &format!("source={name}.monitor"),
+                &format!("source=\"{name}.monitor\""),
                 &format!("sink={real_sink}"),
                 "latency_msec=0",
             ])?;

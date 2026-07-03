@@ -81,6 +81,9 @@ Empirical findings that override upstream documentation:
 - Nova 7 Gen 2 streams dial events (`45 <game> <chat>`) on USB **interface
   5**; interface 3 (where upstream says to listen) only carries the polled
   `b0` status frame. Hence `extra_listen_interfaces`.
+- Nova 7 Gen 2 reports battery as a plain **0-100 percent**, not the 0-128
+  upstream claims (a full 7X Gen 2 sends `0x64` in the `b0` frame — the old
+  128 divisor capped the display at 78%).
 - Interface-3 devices (Nova 7/7+/5) use unnumbered HID reports: hidraw
   writes need a 0x00 report-id prefix (`frame_command`), and reads come back
   as bare payload. The Nova Pro family and Elite use numbered reports

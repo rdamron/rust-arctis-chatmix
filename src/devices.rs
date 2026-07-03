@@ -347,8 +347,10 @@ pub static NOVA_PRO_WIRED: DeviceSpec = DeviceSpec {
 };
 
 // ---------------------------------------------------------------------------
-// Arctis Nova 7 family — untested. Two entries because older firmware
-// reports battery as 0-4 while newer reports 0-128.
+// Arctis Nova 7 family. Two entries because older firmware reports battery
+// as 0-4 while newer reports 0-100 (upstream claims 0-128; hardware says
+// otherwise — see NOVA_7_PERCENT). Only the 7X Gen 2 (0x229e) is verified
+// on real hardware.
 // ---------------------------------------------------------------------------
 
 fn describe_nova_7(fields: &Collected, field: Field) -> Option<String> {
@@ -414,7 +416,9 @@ pub static NOVA_7_PERCENT: DeviceSpec = DeviceSpec {
     status_requests: &[&[0xb0]],
     status_poll_secs: 10,
     frames: NOVA_7_FRAMES,
-    battery_max: 128,
+    // Upstream says 0-128, but a Nova 7X Gen 2 (0x229e) at full charge
+    // reports 0x64 = 100 on real hardware: it's a plain percent.
+    battery_max: 100,
     power_online: &[0x03],
     power_charging: &[],
     charging_on: &[0x01],
@@ -684,7 +688,8 @@ mod tests {
         let status = [0xb0, 0x03, 64, 0x01, 100, 100, 0x02, 0x00, 0x00, 0x01];
         let f = parse_report(&NOVA_7_PERCENT, &status);
         assert!(NOVA_7_PERCENT.is_online(f.get(Field::Power).unwrap()));
-        assert_eq!(NOVA_7_PERCENT.battery_percent(64), 50);
+        assert_eq!(NOVA_7_PERCENT.battery_percent(64), 64);
+        assert_eq!(NOVA_7_PERCENT.battery_percent(100), 100);
         assert_eq!(NOVA_7_DISCRETE.battery_percent(2), 50);
         assert!(NOVA_7_PERCENT.is_charging(&f));
         assert_eq!(f.get(Field::MicMuted), Some(0x01));

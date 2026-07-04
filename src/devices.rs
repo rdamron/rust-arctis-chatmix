@@ -621,6 +621,44 @@ mod tests {
     }
 
     #[test]
+    fn udev_rules_cover_all_product_ids() {
+        let rules = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/70-rust-arctis-chatmix.rules"
+        ));
+        let mut in_rules: Vec<u16> = rules
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let vendor = l
+                    .split("ATTRS{idVendor}==\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or_else(|| panic!("no idVendor in rule line: {l}"));
+                assert_eq!(
+                    u16::from_str_radix(vendor, 16).unwrap(),
+                    VENDOR_ID,
+                    "wrong vendor in rule line: {l}"
+                );
+                let product = l
+                    .split("ATTRS{idProduct}==\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or_else(|| panic!("no idProduct in rule line: {l}"));
+                u16::from_str_radix(product, 16).unwrap()
+            })
+            .collect();
+        let mut in_specs: Vec<u16> =
+            SPECS.iter().flat_map(|s| s.product_ids.iter().copied()).collect();
+        in_rules.sort_unstable();
+        in_specs.sort_unstable();
+        assert_eq!(
+            in_rules, in_specs,
+            "packaging/70-rust-arctis-chatmix.rules is out of sync with SPECS"
+        );
+    }
+
+    #[test]
     fn frame_command_numbered() {
         let framed = frame_command(&[0x06, 0xb0], false);
         assert_eq!(framed.len(), REPORT_LEN);

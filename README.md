@@ -75,9 +75,10 @@ That's it. The script:
    login/boot. On Bazzite this includes **Game Mode**: the user session starts
    at auto-login whether you land in gamescope or the desktop, so the daemon
    runs in both.
-4. Checks it can access the dock's hidraw device. On Bazzite it can already;
-   on stricter distros it offers to install a one-line udev rule (the only
-   step that asks for sudo, and only when needed).
+4. Checks it can access the headset's hidraw device. On Bazzite it can
+   already; on stricter distros it installs a udev rule covering every
+   supported headset (the only step that asks for sudo, and only when
+   needed).
 
 The script detects when it runs inside a distrobox/toolbox and routes
 `systemctl` through `distrobox-host-exec` automatically — handy on atomic
@@ -93,6 +94,10 @@ install -Dm755 target/x86_64-unknown-linux-musl/release/rust-arctis-chatmix ~/.l
 install -Dm644 packaging/rust-arctis-chatmix.service ~/.config/systemd/user/rust-arctis-chatmix.service
 systemctl --user daemon-reload
 systemctl --user enable --now rust-arctis-chatmix
+
+# only if /dev/hidraw* isn't accessible to your user:
+sudo install -Dm644 packaging/70-rust-arctis-chatmix.rules /etc/udev/rules.d/70-rust-arctis-chatmix.rules
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 ## Usage

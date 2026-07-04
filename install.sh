@@ -77,29 +77,27 @@ run_systemctl enable rust-arctis-chatmix
 run_systemctl restart rust-arctis-chatmix
 
 # --- 2. hidraw permission check (root only needed if this fails)
-node=""
+# Supported product ids come from the shipped udev rules file, which a cargo
+# test keeps in sync with src/devices.rs.
+RULES_SRC="$SCRIPT_DIR/packaging/70-rust-arctis-chatmix.rules"
+ids="$(sed -n 's/.*idProduct}=="\([0-9a-f]*\)".*/\1/p' "$RULES_SRC" | tr 'a-f' 'A-F' | paste -sd'|')"
+found=""
+denied=""
 for h in /sys/class/hidraw/hidraw*; do
     [ -e "$h" ] || continue
-    # match the command interface (USB interface 4), the node the daemon opens
-    if grep -qE 'HID_ID=0003:00001038:0000(12E0|12E5|225D)' "$h/device/uevent" 2>/dev/null &&
-       grep -q 'HID_PHYS=.*/input4$' "$h/device/uevent" 2>/dev/null; then
-        node="/dev/$(basename "$h")"
-        break
-    fi
+    grep -qE "HID_ID=0003:00001038:0000($ids)\$" "$h/device/uevent" 2>/dev/null || continue
+    node="/dev/$(basename "$h")"
+    found="$node"
+    { [ -r "$node" ] && [ -w "$node" ]; } || denied="$node"
 done
-if [ -z "$node" ]; then
-    say "Base station not detected right now; skipping the permission check."
+if [ -z "$found" ]; then
+    say "No supported Arctis device detected right now; skipping the permission check."
     say "(The daemon waits for the device, so this is fine.)"
-elif [ -r "$node" ] && [ -w "$node" ]; then
-    say "hidraw permissions OK ($node)"
+elif [ -z "$denied" ]; then
+    say "hidraw permissions OK ($found)"
 else
-    say "No access to $node — installing a udev rule (needs sudo)"
-    sudo tee "$UDEV_RULE" >/dev/null <<'EOF'
-# SteelSeries Arctis Nova Pro Wireless base station — user access for rust-arctis-chatmix
-KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e0", TAG+="uaccess"
-KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e5", TAG+="uaccess"
-KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="225d", TAG+="uaccess"
-EOF
+    say "No access to $denied — installing a udev rule (needs sudo)"
+    sudo install -Dm644 "$RULES_SRC" "$UDEV_RULE"
     sudo udevadm control --reload
     sudo udevadm trigger
 fi

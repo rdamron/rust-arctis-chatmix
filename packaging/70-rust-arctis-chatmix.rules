@@ -1,0 +1,42 @@
+# SteelSeries Arctis headsets — seated-user hidraw access for rust-arctis-chatmix.
+# One line per USB product id; must stay in sync with src/devices.rs
+# (enforced by the udev_rules_cover_all_product_ids cargo test).
+
+# Arctis Nova Pro Wireless
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e0", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12e5", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="225d", TAG+="uaccess"
+
+# Arctis Nova Pro (wired GameDAC Gen 2)
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12cd", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12cb", TAG+="uaccess"
+
+# Arctis Nova 7 (discrete battery)
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2202", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2206", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="22a4", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="223a", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="227a", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="22ab", TAG+="uaccess"
+
+# Arctis Nova 7 (percent battery)
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="22a1", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="227e", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2258", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="229e", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="22a9", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="22a5", TAG+="uaccess"
+
+# Arctis 7+
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="220e", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2212", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2216", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2236", TAG+="uaccess"
+
+# Arctis Nova 5
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2232", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2253", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2264", TAG+="uaccess"
+
+# Arctis Nova Elite
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="2244", TAG+="uaccess"

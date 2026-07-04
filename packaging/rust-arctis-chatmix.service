@@ -1,5 +1,5 @@
 [Unit]
-Description=Arctis Nova Pro Wireless ChatMix daemon (Game/Chat virtual sinks)
+Description=SteelSeries Arctis ChatMix daemon (Game/Chat virtual sinks)
 After=pipewire.service pipewire-pulse.service
 Wants=pipewire-pulse.service
 

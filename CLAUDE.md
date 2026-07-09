@@ -45,7 +45,7 @@ debugging (reading raw HID reports, checking sinks) does not need the host.
 
 ## Architecture
 
-Two files:
+See `ARCHITECTURE.md` for the full flow. Module map:
 
 - `src/devices.rs` — declarative `DeviceSpec` table, one per headset family.
   A spec describes: USB product ids, which USB interface takes commands and
@@ -54,10 +54,16 @@ Two files:
   prefix + byte offsets of `Field`s like GameMix/Battery/Power). Semantics
   (battery scale, which power values mean "online"/"charging") and a
   `describe` fn for human-readable status output are also per-spec.
-- `src/main.rs` — everything else: hidraw discovery (sysfs uevent matching),
-  the session loop (init → poll fds → parse reports → apply mix/status),
-  PipeWire plumbing via `pactl` subprocess calls, default-sink
-  claim/release, self-healing health checks, and the `status` subcommand.
+- `src/hid.rs` — hidraw discovery (sysfs uevent matching) and raw I/O:
+  `find_hidraw`, `write_command` (with the framing fallback), poll helpers.
+- `src/audio.rs` — PipeWire plumbing via `pactl` subprocess calls: sink
+  names, virtual sink setup/teardown, sink snapshots, volumes, default sink.
+- `src/session.rs` — the daemon state machine: `run_session` (init → poll
+  fds → parse reports → apply mix/status), default-sink claim/release,
+  self-healing health checks, low-battery warnings.
+- `src/status.rs` — the one-shot `status` subcommand.
+- `src/main.rs` — arg parsing, logging, signals, and the outer
+  discovery/retry loop.
 
 The daemon is deliberately dumb about state: a 3s health tick re-checks that
 sinks exist and rebuilds them (PipeWire restarts, device unplug, profile

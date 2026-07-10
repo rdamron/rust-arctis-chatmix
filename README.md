@@ -32,8 +32,8 @@ provides the two sinks (adjust their volumes manually) plus battery/status.
 
 ## What it does
 
-- Creates two virtual PipeWire sinks, **Arctis Game** (`arctis_game`) and
-  **Arctis Chat** (`arctis_chat`), each routed into the headset's real output.
+- Creates two virtual PipeWire sinks, **Arctis Game** and **Arctis Chat**,
+  each routed into the headset's real output.
 - Sends the device the Sonar/ChatMix enable handshake where it needs one (Nova
   Pro family, Nova Elite), so **pressing the wheel toggles between volume and
   ChatMix mode** on the dock's display.
@@ -144,7 +144,9 @@ the protocols were reverse-engineered by the
 [Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager) project
 (see its `devices/*.yaml`) — this tool is a minimal single-binary take on the
 same idea. Audio plumbing is plain `pactl` against pipewire-pulse:
-`module-null-sink` + `module-loopback`.
+`module-null-sink` + `module-loopback`. For the full picture — discovery,
+the event loop, self-healing, the device spec table — see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## License
 

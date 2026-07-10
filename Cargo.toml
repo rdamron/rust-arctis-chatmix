@@ -1,6 +1,6 @@
 [package]
 name = "rust-arctis-chatmix"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ChatMix daemon for SteelSeries Arctis headsets: creates Game/Chat PipeWire sinks and drives their volumes from the ChatMix dial"
 license = "GPL-3.0-only"

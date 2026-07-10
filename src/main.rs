@@ -64,11 +64,12 @@ fn usage() {
          \n\
          Supported: Nova Pro Wireless, Nova Pro (GameDAC Gen 2), Nova 7 family,\n\
          Arctis 7+, Nova Elite, Nova 5 (sinks/status only). Only the Nova Pro\n\
-         Wireless has been verified on real hardware.\n\
+         Wireless and Nova 7X Gen 2 have been verified on real hardware.\n\
          \n\
          status              one-shot query: battery, power, mic, ...\n\
          --no-default-sink   never touch the default sink\n\
          --verbose, -v       log every dial adjustment\n\
+         --version, -V       print the version\n\
          --help, -h          this text"
     );
 }
@@ -81,6 +82,10 @@ fn main() {
             "status" => sub_status = true,
             "--no-default-sink" => manage_default = false,
             "--verbose" | "-v" => VERBOSE.store(true, Ordering::Relaxed),
+            "--version" | "-V" => {
+                println!("rust-arctis-chatmix {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "--help" | "-h" => {
                 usage();
                 return;
@@ -97,6 +102,7 @@ fn main() {
     }
 
     install_signal_handlers();
+    log(&format!("v{} starting", env!("CARGO_PKG_VERSION")));
 
     let mut announced_wait = false;
     while RUNNING.load(Ordering::SeqCst) {

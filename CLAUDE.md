@@ -30,6 +30,12 @@ Deploying a change to this machine:
 
 ## Publishing a release
 
+**Standing rule: releases are not optional.** Whenever a push to `main`
+changes what the binary does (`src/**`, `Cargo.toml` dependencies — not
+docs/CI-only changes), bump the version and publish in the same session,
+unasked. The user relies on this happening automatically; the latest
+release must never lag the code. Patch bump for fixes, minor for features.
+
 Toolchain-less installs download the latest GitHub Release asset
 (`releases/latest/download/rust-arctis-chatmix`), built by CI from the tag —
 there is no binary in the repo. To publish:

@@ -22,13 +22,34 @@ cargo test  --target x86_64-unknown-linux-musl nova_7        # single test by na
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Deploying a change (the repo ships a prebuilt binary in `dist/` for
-toolchain-less installs — refresh it whenever you cut a release build):
+Deploying a change to this machine:
 
 ```sh
-cp target/x86_64-unknown-linux-musl/release/rust-arctis-chatmix dist/
-./install.sh        # installs to ~/.local/bin, (re)starts the systemd user service
+./install.sh        # builds, installs to ~/.local/bin, (re)starts the systemd user service
 ```
+
+## Publishing a release
+
+Toolchain-less installs download the latest GitHub Release asset
+(`releases/latest/download/rust-arctis-chatmix`), built by CI from the tag —
+there is no binary in the repo. To publish:
+
+1. Bump `version` in `Cargo.toml`, commit (Cargo.lock updates on build).
+2. Push, then tag and push the tag — **pushes must go through the host**
+   (the container has no git credentials):
+
+   ```sh
+   distrobox-host-exec git -C /var/home/aj/Projects/rust-arctis-chatmix push
+   git tag -a v0.x.y -m "summary of the release"
+   distrobox-host-exec git -C /var/home/aj/Projects/rust-arctis-chatmix push origin v0.x.y
+   ```
+
+3. The `Release` workflow (`.github/workflows/release.yml`) tests, builds the
+   musl binary, and creates the release with the binary attached and
+   auto-generated notes. Nothing is uploaded manually.
+4. Verify with plain curl (no `gh` on host or container):
+   `curl -s https://api.github.com/repos/rdamron/rust-arctis-chatmix/releases/latest`
+   — check `tag_name` and that `assets` lists `rust-arctis-chatmix`.
 
 `install.sh` detects distrobox/toolbox and routes `systemctl` through
 `distrobox-host-exec` automatically. From inside a container, inspect the

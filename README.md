@@ -68,8 +68,9 @@ git clone <this repo> && cd rust-arctis-chatmix
 
 That's it. The script:
 
-1. Builds the binary if you have Rust, otherwise uses the prebuilt static
-   binary in `dist/` (no toolchain needed).
+1. Builds the binary if you have Rust, otherwise downloads the [latest
+   release](https://github.com/rdamron/rust-arctis-chatmix/releases/latest)'s
+   static binary (no toolchain needed).
 2. Installs it to `~/.local/bin/rust-arctis-chatmix`.
 3. Installs and enables a systemd **user** service, so it starts at every
    login/boot. On Bazzite this includes **Game Mode**: the user session starts
@@ -89,7 +90,7 @@ Uninstall with `./install.sh --uninstall`.
 ### Manual install
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-musl   # or use dist/rust-arctis-chatmix
+cargo build --release --target x86_64-unknown-linux-musl   # or download from the releases page
 install -Dm755 target/x86_64-unknown-linux-musl/release/rust-arctis-chatmix ~/.local/bin/rust-arctis-chatmix
 install -Dm644 packaging/rust-arctis-chatmix.service ~/.config/systemd/user/rust-arctis-chatmix.service
 systemctl --user daemon-reload

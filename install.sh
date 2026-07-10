@@ -47,7 +47,9 @@ case "${1:-}" in
     *) echo "usage: $0 [--uninstall]" >&2; exit 2 ;;
 esac
 
-# --- 1. get a binary: build if a toolchain is around, else use the prebuilt one
+# --- 1. get a binary: build if a toolchain is around, else download the
+#        latest release (built by CI from the tagged source)
+RELEASE_URL="https://github.com/rdamron/rust-arctis-chatmix/releases/latest/download/$BIN"
 SRC=""
 if command -v cargo >/dev/null 2>&1; then
     if rustup target list --installed 2>/dev/null | grep -q "$TARGET"; then
@@ -59,12 +61,22 @@ if command -v cargo >/dev/null 2>&1; then
         (cd "$SCRIPT_DIR" && cargo build --release)
         SRC="$SCRIPT_DIR/target/release/$BIN"
     fi
-elif [ -x "$SCRIPT_DIR/dist/$BIN" ]; then
-    say "No Rust toolchain found; using prebuilt static binary from dist/"
-    SRC="$SCRIPT_DIR/dist/$BIN"
 else
-    echo "error: need either cargo (https://rustup.rs) or the prebuilt dist/$BIN" >&2
-    exit 1
+    say "No Rust toolchain found; downloading the latest release binary"
+    SRC="$(mktemp -t rust-arctis-chatmix.XXXXXX)"
+    trap 'rm -f "$SRC"' EXIT
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$SRC" "$RELEASE_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$SRC" "$RELEASE_URL"
+    else
+        echo "error: need cargo (https://rustup.rs), or curl/wget to fetch $RELEASE_URL" >&2
+        exit 1
+    fi
+    if [ "$(head -c 4 "$SRC")" != $'\x7fELF' ]; then
+        echo "error: download from $RELEASE_URL doesn't look like a binary" >&2
+        exit 1
+    fi
 fi
 
 say "Installing $BIN to $BIN_DIR"

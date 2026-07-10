@@ -4,28 +4,29 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::audio::{
-    get_default_sink, pactl, set_mix, snapshot_sinks, unload_our_modules, Sinks, CHAT_SINK,
-    GAME_SINK,
-};
+use crate::audio::{Audio, Pactl, SinkWatch, WatchEvent, CHAT_SINK, GAME_SINK};
 use crate::devices::{parse_report, Collected, DeviceSpec, Field, REPORT_LEN};
 use crate::hid::{poll_any, poll_ready, write_command, FoundDevice};
 use crate::{log, log_verbose, RUNNING};
 
-/// How often to verify the real sink and virtual sinks still exist.
+/// How often to verify the real sink and virtual sinks still exist when
+/// `pactl subscribe` isn't available, and how often to retry spawning it.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(3);
+/// With a live event stream the tick is only a safety net.
+const HEALTH_INTERVAL_EVENTED: Duration = Duration::from_secs(30);
 /// Warn when the battery falls to this percentage; clear once it recovers
 /// past the higher bound (or the headset is charging).
 const LOW_BATTERY_WARN_PCT: u32 = 25;
 const LOW_BATTERY_CLEAR_PCT: u32 = 50;
 
-struct Session {
+struct Session<'a> {
     spec: &'static DeviceSpec,
-    sinks: Option<Sinks>,
+    audio: &'a dyn Audio,
+    /// `Some(real_sink)` while our virtual sinks exist, routed into it.
+    sinks: Option<String>,
     /// Default sink before we claimed it; restored when the headset powers
     /// off and on exit.
     prev_default: Option<String>,
@@ -38,10 +39,11 @@ struct Session {
     warned_no_sink: bool,
 }
 
-impl Session {
-    fn new(spec: &'static DeviceSpec, manage_default: bool) -> Self {
+impl<'a> Session<'a> {
+    fn new(spec: &'static DeviceSpec, manage_default: bool, audio: &'a dyn Audio) -> Self {
         Self {
             spec,
+            audio,
             sinks: None,
             prev_default: None,
             manage_default,
@@ -55,7 +57,7 @@ impl Session {
 
     fn claim_default(&self) {
         if self.manage_default && self.sinks.is_some() {
-            let _ = pactl(&["set-default-sink", GAME_SINK]);
+            let _ = self.audio.set_default_sink(GAME_SINK);
         }
     }
 
@@ -65,17 +67,17 @@ impl Session {
         }
         // Only hand it back if we still hold it — don't stomp on a choice
         // the user made in the meantime.
-        let current = get_default_sink();
+        let current = self.audio.default_sink();
         if !matches!(current.as_deref(), Some(GAME_SINK) | Some(CHAT_SINK)) {
             return;
         }
         if let Some(prev) = &self.prev_default {
-            if pactl(&["set-default-sink", prev]).is_ok() {
+            if self.audio.set_default_sink(prev).is_ok() {
                 return;
             }
         }
-        if let Some(sinks) = &self.sinks {
-            let _ = pactl(&["set-default-sink", &sinks.real_sink]);
+        if let Some(real) = &self.sinks {
+            let _ = self.audio.set_default_sink(real);
         }
     }
 
@@ -83,14 +85,14 @@ impl Session {
     /// alive, (re)creating them as needed. Handles first-time setup, the audio
     /// device disappearing (profile off / unplug), and PipeWire restarts.
     fn ensure_sinks(&mut self) {
-        let Some(snap) = snapshot_sinks(self.spec) else {
+        let Some(snap) = self.audio.snapshot(self.spec) else {
             return; // pactl unavailable right now (pipewire restarting); retry next tick
         };
 
         let Some(real) = snap.real else {
             if self.sinks.take().is_some() {
                 log("Arctis audio sink disappeared, removing virtual sinks");
-                unload_our_modules();
+                self.audio.teardown_sinks();
             } else if !self.warned_no_sink {
                 log("waiting for Arctis audio sink...");
                 self.warned_no_sink = true;
@@ -100,7 +102,7 @@ impl Session {
 
         let need_setup = match &self.sinks {
             None => true,
-            Some(s) => s.real_sink != real || !snap.game || !snap.chat,
+            Some(s) => *s != real || !snap.game || !snap.chat,
         };
         if !need_setup {
             return;
@@ -111,15 +113,17 @@ impl Session {
         }
         if self.prev_default.is_none() {
             // Capture before claiming; never remember our own sinks as "previous".
-            self.prev_default =
-                get_default_sink().filter(|d| d != GAME_SINK && d != CHAT_SINK);
+            self.prev_default = self
+                .audio
+                .default_sink()
+                .filter(|d| d != GAME_SINK && d != CHAT_SINK);
         }
-        match Sinks::setup(&real) {
-            Ok(sinks) => {
+        match self.audio.setup_sinks(&real) {
+            Ok(()) => {
                 log(&format!("routing {GAME_SINK}/{CHAT_SINK} -> {real}"));
-                self.sinks = Some(sinks);
+                self.sinks = Some(real);
                 self.warned_no_sink = false;
-                set_mix(self.last_mix.0, self.last_mix.1);
+                self.audio.set_mix(self.last_mix.0, self.last_mix.1);
                 // Claim the default unless we know the headset is off.
                 if self.online != Some(false) {
                     self.claim_default();
@@ -135,7 +139,7 @@ impl Session {
         }
         self.last_mix = (game, chat);
         if self.sinks.is_some() {
-            set_mix(game, chat);
+            self.audio.set_mix(game, chat);
             log_verbose(&format!("chatmix: game {game}% / chat {chat}%"));
         }
     }
@@ -165,7 +169,7 @@ impl Session {
                             "headset powered on ({}), claiming default sink",
                             self.battery_str()
                         ));
-                        set_mix(self.last_mix.0, self.last_mix.1);
+                        self.audio.set_mix(self.last_mix.0, self.last_mix.1);
                         self.claim_default();
                     } else {
                         log(&format!("headset {power_str}, releasing default sink"));
@@ -180,16 +184,7 @@ impl Session {
         if let Some(pct) = self.battery_pct {
             if self.online != Some(false) && pct <= LOW_BATTERY_WARN_PCT && !self.battery_warned {
                 log(&format!("LOW BATTERY: headset at {pct}%"));
-                let _ = Command::new("notify-send")
-                    .args([
-                        "-u",
-                        "critical",
-                        "-a",
-                        "rust-arctis-chatmix",
-                        "Arctis headset battery low",
-                        &format!("{pct}% remaining"),
-                    ])
-                    .status();
+                self.audio.notify_low_battery(pct);
                 self.battery_warned = true;
             } else if pct >= LOW_BATTERY_CLEAR_PCT || charging {
                 self.battery_warned = false;
@@ -200,7 +195,7 @@ impl Session {
     fn teardown(&mut self) {
         self.release_default();
         if self.sinks.take().is_some() {
-            unload_our_modules();
+            self.audio.teardown_sinks();
             log("virtual sinks removed");
         }
     }
@@ -223,7 +218,7 @@ pub(crate) fn run_session(found: &FoundDevice, manage_default: bool) -> Result<b
             Err(e) => log(&format!("cannot open {} (ignoring): {e}", path.display())),
         }
     }
-    let all_fds: Vec<i32> = std::iter::once(dev.as_raw_fd())
+    let dev_fds: Vec<i32> = std::iter::once(dev.as_raw_fd())
         .chain(extras.iter().map(|f| f.as_raw_fd()))
         .collect();
     let mut unnumbered = spec.unnumbered_reports;
@@ -250,8 +245,16 @@ pub(crate) fn run_session(found: &FoundDevice, manage_default: bool) -> Result<b
         ));
     }
 
-    let mut session = Session::new(spec, manage_default);
+    let audio = Pactl;
+    let mut session = Session::new(spec, manage_default, &audio);
     session.ensure_sinks();
+
+    // Sink changes arrive as events; the health tick is a slow safety net
+    // (and the polling fallback when the event stream isn't available).
+    let mut watch = SinkWatch::spawn();
+    if watch.is_none() {
+        log("pactl subscribe unavailable, falling back to sink polling");
+    }
     let mut last_health = Instant::now();
     let mut last_status_poll = Instant::now();
     let status_poll = Duration::from_secs(spec.status_poll_secs);
@@ -260,9 +263,18 @@ pub(crate) fn run_session(found: &FoundDevice, manage_default: bool) -> Result<b
         if !RUNNING.load(Ordering::SeqCst) {
             break Ok(false);
         }
-        if last_health.elapsed() >= HEALTH_INTERVAL {
+        let health_interval = if watch.is_some() {
+            HEALTH_INTERVAL_EVENTED
+        } else {
+            HEALTH_INTERVAL
+        };
+        if last_health.elapsed() >= health_interval {
             session.ensure_sinks();
             last_health = Instant::now();
+            if watch.is_none() {
+                // PipeWire may be back after a restart; resubscribe.
+                watch = SinkWatch::spawn();
+            }
         }
         if spec.has_status() && last_status_poll.elapsed() >= status_poll {
             let mut failed = false;
@@ -277,8 +289,27 @@ pub(crate) fn run_session(found: &FoundDevice, manage_default: bool) -> Result<b
             }
             last_status_poll = Instant::now();
         }
-        if !poll_any(&all_fds, 250) {
+
+        let mut fds = dev_fds.clone();
+        if let Some(w) = &watch {
+            fds.push(w.fd());
+        }
+        if !poll_any(&fds, 250) {
             continue;
+        }
+
+        if let Some(w) = &mut watch {
+            match w.drain() {
+                WatchEvent::Changed => {
+                    session.ensure_sinks();
+                    last_health = Instant::now();
+                }
+                WatchEvent::Quiet => {}
+                WatchEvent::Ended => {
+                    log("PipeWire event stream ended, falling back to sink polling");
+                    watch = None;
+                }
+            }
         }
 
         let mut mix: Option<(u8, u8)> = None;
@@ -325,4 +356,242 @@ pub(crate) fn run_session(found: &FoundDevice, manage_default: bool) -> Result<b
 
     session.teardown();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::SinkSnapshot;
+    use crate::devices::NOVA_PRO_WIRELESS;
+    use std::cell::RefCell;
+
+    /// Records every audio operation; snapshot and default sink are
+    /// scriptable. `set_default_sink` updates the fake default, mirroring
+    /// the real server.
+    #[derive(Default)]
+    struct FakeAudio {
+        calls: RefCell<Vec<String>>,
+        snapshot: RefCell<Option<SinkSnapshot>>,
+        default: RefCell<Option<String>>,
+    }
+
+    impl FakeAudio {
+        fn set_snapshot(&self, game: bool, chat: bool, real: Option<&str>) {
+            *self.snapshot.borrow_mut() = Some(SinkSnapshot {
+                game,
+                chat,
+                real: real.map(str::to_string),
+            });
+        }
+
+        fn set_default(&self, sink: &str) {
+            *self.default.borrow_mut() = Some(sink.to_string());
+        }
+
+        fn take_calls(&self) -> Vec<String> {
+            self.calls.replace(Vec::new())
+        }
+    }
+
+    impl Audio for FakeAudio {
+        fn snapshot(&self, _spec: &DeviceSpec) -> Option<SinkSnapshot> {
+            self.snapshot.borrow().clone()
+        }
+
+        fn setup_sinks(&self, real_sink: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("setup:{real_sink}"));
+            Ok(())
+        }
+
+        fn teardown_sinks(&self) {
+            self.calls.borrow_mut().push("teardown".into());
+        }
+
+        fn set_mix(&self, game: u8, chat: u8) {
+            self.calls.borrow_mut().push(format!("mix:{game}/{chat}"));
+        }
+
+        fn default_sink(&self) -> Option<String> {
+            self.default.borrow().clone()
+        }
+
+        fn set_default_sink(&self, sink: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("default:{sink}"));
+            *self.default.borrow_mut() = Some(sink.to_string());
+            Ok(())
+        }
+
+        fn notify_low_battery(&self, pct: u32) {
+            self.calls.borrow_mut().push(format!("notify:{pct}"));
+        }
+    }
+
+    fn status(power: Option<u8>, battery: Option<u8>) -> Collected {
+        let mut c = Collected::default();
+        if let Some(p) = power {
+            c.insert(Field::Power, p);
+        }
+        if let Some(b) = battery {
+            c.insert(Field::Battery, b);
+        }
+        c
+    }
+
+    /// A session with sinks built: real sink "alsa_out", previous default
+    /// "speakers", default claimed.
+    fn established(audio: &FakeAudio) -> Session<'_> {
+        audio.set_snapshot(false, false, Some("alsa_out"));
+        audio.set_default("speakers");
+        let mut s = Session::new(&NOVA_PRO_WIRELESS, true, audio);
+        s.ensure_sinks();
+        audio.take_calls();
+        s
+    }
+
+    // NOVA_PRO_WIRELESS semantics used below: battery_max 8 (raw 2 = 25%,
+    // raw 4 = 50%), power 0x08 = online, 0x00 = offline.
+
+    #[test]
+    fn first_setup_claims_default_and_replays_mix() {
+        let audio = FakeAudio::default();
+        audio.set_snapshot(false, false, Some("alsa_out"));
+        audio.set_default("speakers");
+        let mut s = Session::new(&NOVA_PRO_WIRELESS, true, &audio);
+        s.ensure_sinks();
+        assert_eq!(
+            audio.take_calls(),
+            ["setup:alsa_out", "mix:100/100", "default:Arctis Game"]
+        );
+        // The user's sink was remembered, not ours.
+        assert_eq!(s.prev_default.as_deref(), Some("speakers"));
+    }
+
+    #[test]
+    fn healthy_sinks_are_left_alone() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        audio.set_snapshot(true, true, Some("alsa_out"));
+        s.ensure_sinks();
+        assert!(audio.take_calls().is_empty());
+    }
+
+    #[test]
+    fn missing_virtual_sink_triggers_rebuild() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        audio.set_snapshot(true, false, Some("alsa_out")); // chat sink lost
+        s.ensure_sinks();
+        assert!(audio.take_calls().contains(&"setup:alsa_out".to_string()));
+    }
+
+    #[test]
+    fn real_sink_change_triggers_rebuild() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        audio.set_snapshot(true, true, Some("other_out"));
+        s.ensure_sinks();
+        assert!(audio.take_calls().contains(&"setup:other_out".to_string()));
+        assert_eq!(s.sinks.as_deref(), Some("other_out"));
+    }
+
+    #[test]
+    fn vanished_real_sink_tears_down_once() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        audio.set_snapshot(false, false, None);
+        s.ensure_sinks();
+        assert_eq!(audio.take_calls(), ["teardown"]);
+        s.ensure_sinks(); // still gone: no repeated teardown
+        assert!(audio.take_calls().is_empty());
+    }
+
+    #[test]
+    fn power_off_restores_previous_default() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.apply_status(&status(Some(0x08), Some(8))); // first report: online
+        audio.take_calls();
+        s.apply_status(&status(Some(0x00), None)); // powered off
+        assert_eq!(audio.take_calls(), ["default:speakers"]);
+    }
+
+    #[test]
+    fn release_respects_a_manual_default_change() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.apply_status(&status(Some(0x08), Some(8)));
+        audio.take_calls();
+        audio.set_default("usb-dac"); // user picked something else meanwhile
+        s.apply_status(&status(Some(0x00), None));
+        assert!(audio.take_calls().is_empty());
+        assert_eq!(audio.default_sink().as_deref(), Some("usb-dac"));
+    }
+
+    #[test]
+    fn power_on_reclaims_default_and_replays_mix() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.apply_status(&status(Some(0x08), Some(8)));
+        s.handle_mix(60, 80);
+        s.apply_status(&status(Some(0x00), None));
+        audio.take_calls();
+        s.apply_status(&status(Some(0x08), None)); // powered back on
+        assert_eq!(audio.take_calls(), ["mix:60/80", "default:Arctis Game"]);
+    }
+
+    #[test]
+    fn disabled_default_management_never_touches_default() {
+        let audio = FakeAudio::default();
+        audio.set_snapshot(false, false, Some("alsa_out"));
+        audio.set_default("speakers");
+        let mut s = Session::new(&NOVA_PRO_WIRELESS, false, &audio);
+        s.ensure_sinks();
+        s.apply_status(&status(Some(0x08), Some(8)));
+        s.apply_status(&status(Some(0x00), None));
+        s.apply_status(&status(Some(0x08), None));
+        s.teardown();
+        assert!(!audio
+            .take_calls()
+            .iter()
+            .any(|c| c.starts_with("default:")));
+    }
+
+    #[test]
+    fn low_battery_warns_once_with_hysteresis() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.apply_status(&status(Some(0x08), Some(8))); // 100%: no warning
+        audio.take_calls();
+
+        s.apply_status(&status(None, Some(2))); // 25%: warn
+        assert_eq!(audio.take_calls(), ["notify:25"]);
+        s.apply_status(&status(None, Some(2))); // still 25%: no repeat
+        assert!(audio.take_calls().is_empty());
+
+        s.apply_status(&status(None, Some(3))); // 37%: below the clear bound, stays latched
+        assert!(audio.take_calls().is_empty());
+        s.apply_status(&status(None, Some(2))); // dipping again without recovery: silent
+        assert!(audio.take_calls().is_empty());
+
+        s.apply_status(&status(None, Some(4))); // 50%: re-arms the warning
+        s.apply_status(&status(None, Some(2))); // 25% again: warns again
+        assert_eq!(audio.take_calls(), ["notify:25"]);
+    }
+
+    #[test]
+    fn no_battery_warning_while_powered_off() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.apply_status(&status(Some(0x00), Some(1))); // off, 12%
+        assert!(!audio.take_calls().iter().any(|c| c.starts_with("notify:")));
+    }
+
+    #[test]
+    fn teardown_releases_default_and_unloads() {
+        let audio = FakeAudio::default();
+        let mut s = established(&audio);
+        s.teardown();
+        assert_eq!(audio.take_calls(), ["default:speakers", "teardown"]);
+        assert!(s.sinks.is_none());
+    }
 }

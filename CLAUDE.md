@@ -65,10 +65,13 @@ See `ARCHITECTURE.md` for the full flow. Module map:
 - `src/main.rs` — arg parsing, logging, signals, and the outer
   discovery/retry loop.
 
-The daemon is deliberately dumb about state: a 3s health tick re-checks that
+The daemon is deliberately dumb about state: a health check re-checks that
 sinks exist and rebuilds them (PipeWire restarts, device unplug, profile
-toggles), and a device disconnect just tears down the session and re-enters
-the discovery loop.
+toggles) — triggered by `pactl subscribe` events with a 30s safety tick, or
+3s polling when subscribe is unavailable — and a device disconnect just
+tears down the session and re-enters the discovery loop. `Session` talks to
+PipeWire through the `Audio` trait so its state machine is unit-testable
+(`session::tests` against a fake).
 
 Design rule: init sequences must never include upstream commands that
 overwrite on-device settings (EQ, sidetone, auto-off, wireless mode...) —

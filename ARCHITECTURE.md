@@ -86,9 +86,11 @@ run_session(found)                                            │
  │  send spec.init (ChatMix enable), then status requests     │
  │  Session::ensure_sinks()  — first sink setup               │
  ▼                                                            │
-event loop (poll all fds, 250 ms timeout)                     │
+event loop (poll all fds + `pactl subscribe` stdout, 250 ms)  │
  │                                                            │
- ├─ every 3 s (HEALTH_INTERVAL): ensure_sinks()               │
+ ├─ sink/module added or removed (subscribe event), plus a    │
+ │  30 s safety tick — or every 3 s if subscribe is           │
+ │  unavailable: ensure_sinks()                               │
  │    snapshot sinks via `pactl -f json list sinks`:          │
  │    • real headset sink gone → unload our modules, wait     │
  │    • our sinks gone / real sink changed → rebuild          │
@@ -112,8 +114,8 @@ SIGINT/SIGTERM or fatal error → teardown → exit
 
 `Session` holds the little state the daemon keeps between ticks:
 
-- `sinks: Option<Sinks>` — whether our virtual sinks currently exist, and
-  which real sink they loop into.
+- `sinks` — whether our virtual sinks currently exist, and which real sink
+  they loop into.
 - `last_mix` — last dial position; replayed after a sink rebuild so volumes
   survive a PipeWire restart.
 - `online: Option<bool>` — headset power state, `None` until the first
@@ -127,7 +129,15 @@ SIGINT/SIGTERM or fatal error → teardown → exit
 
 All audio work goes through `pactl` subprocess calls (talking to
 pipewire-pulse) — no native PipeWire bindings, which keeps the binary a
-trivially static musl build.
+trivially static musl build. The operations `Session` needs sit behind the
+`Audio` trait (`Pactl` is the real implementation), so the state machine is
+unit-tested against a fake with no PipeWire involved (`session::tests`).
+
+- **Change detection**: a `pactl subscribe` child process streams events into
+  the session's poll loop; only *new*/*remove* events on sinks and modules
+  trigger a re-check ('change' events fire on every volume tweak, including
+  our own). If the stream dies (PipeWire restart) or can't start, the daemon
+  falls back to 3-second polling and resubscribes once `pactl` works again.
 
 - **Setup** loads, per sink, a `module-null-sink` plus a `module-loopback`
   from its monitor into the real sink (`latency_msec=0`). Before loading,
@@ -150,7 +160,8 @@ trivially static musl build.
 Every failure funnels into one of two paths:
 
 - **Transient audio trouble** (pactl fails, sink missing): do nothing this
-  tick; the 3-second health check retries forever.
+  tick; the health check (event-driven, with a polling fallback) retries
+  forever.
 - **Device trouble** (hidraw read/write error): tear down the session
   (release default sink, unload modules) and fall back to the discovery
   loop, which waits for the device to reappear.
